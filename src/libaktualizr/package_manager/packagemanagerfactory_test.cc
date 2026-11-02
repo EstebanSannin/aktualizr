@@ -39,6 +39,17 @@ TEST(PackageManagerFactory, None) {
   EXPECT_TRUE(pacman);
 }
 
+TEST(PackageManagerFactory, Rauc) {
+  Config config;
+  TemporaryDirectory dir;
+  config.storage.path = dir.Path();
+  std::shared_ptr<INvStorage> storage = INvStorage::newStorage(config.storage);
+  config.pacman.type = PACKAGE_MANAGER_RAUC;
+  std::shared_ptr<PackageManagerInterface> pacman =
+      PackageManagerFactory::makePackageManager(config.pacman, config.bootloader, storage, nullptr);
+  EXPECT_TRUE(pacman);
+}
+
 TEST(PackageManagerFactory, Bad) {
   Config config;
   TemporaryDirectory dir;

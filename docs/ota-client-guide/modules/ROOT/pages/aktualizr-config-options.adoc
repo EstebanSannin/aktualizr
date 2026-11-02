@@ -140,7 +140,7 @@ Options for package management and update installation. Note that this only coin
 [options="header"]
 |==========================================================================================
 | Name               | Default                   | Description
-| `type`             | `"ostree"`                | Which package manager to use. Options: `"ostree"`, `"none"`.
+| `type`             | `"ostree"`                | Which package manager to use. Options: `"ostree"`, `"rauc"`, `"none"`.
 | `os`               |                           | OSTree operating system group. Only used with `ostree`.
 | `sysroot`          |                           | Path to an OSTree sysroot. Only used with `ostree`.
 | `ostree_server`    |                           | OSTree server URL. Only used with `ostree`. If empty, set to `tls.server` with `/treehub` appended.

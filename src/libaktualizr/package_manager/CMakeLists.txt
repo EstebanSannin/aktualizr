@@ -1,8 +1,10 @@
 set(SOURCES packagemanagerfactory.cc
             packagemanagerfake.cc
-            packagemanagerinterface.cc)
+            packagemanagerinterface.cc
+            raucmanager.cc)
 
-set(HEADERS packagemanagerfake.h)
+set(HEADERS packagemanagerfake.h
+            raucmanager.h)
 
 add_library(package_manager OBJECT ${SOURCES})
 aktualizr_source_file_checks(${SOURCES} packagemanagerconfig.cc ${HEADERS})
@@ -10,6 +12,7 @@ aktualizr_source_file_checks(${SOURCES} packagemanagerconfig.cc ${HEADERS})
 target_sources(config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/packagemanagerconfig.cc)
 
 add_aktualizr_test(NAME packagemanagerfake SOURCES packagemanagerfake_test.cc LIBRARIES PUBLIC uptane_generator_lib)
+add_aktualizr_test(NAME raucmanager SOURCES raucmanager_test.cc NO_VALGRIND)
 
 # OSTree backend
 if(BUILD_OSTREE)
@@ -36,6 +39,7 @@ aktualizr_source_file_checks(fetcher_death_test.cc
                              packagemanagerconfig_test.cc
                              packagemanagerfake_test.cc
                              packagemanagerfactory_test.cc
+                             raucmanager_test.cc
                              ostreemanager_test.cc
                              ostreemanager.cc
                              ostreemanager.h)
