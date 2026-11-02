@@ -39,6 +39,7 @@ TEST(PackageManagerFactory, None) {
   EXPECT_TRUE(pacman);
 }
 
+#ifdef BUILD_RAUC
 TEST(PackageManagerFactory, Rauc) {
   Config config;
   TemporaryDirectory dir;
@@ -49,6 +50,7 @@ TEST(PackageManagerFactory, Rauc) {
       PackageManagerFactory::makePackageManager(config.pacman, config.bootloader, storage, nullptr);
   EXPECT_TRUE(pacman);
 }
+#endif
 
 TEST(PackageManagerFactory, Bad) {
   Config config;

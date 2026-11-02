@@ -1,10 +1,8 @@
 set(SOURCES packagemanagerfactory.cc
             packagemanagerfake.cc
-            packagemanagerinterface.cc
-            raucmanager.cc)
+            packagemanagerinterface.cc)
 
-set(HEADERS packagemanagerfake.h
-            raucmanager.h)
+set(HEADERS packagemanagerfake.h)
 
 add_library(package_manager OBJECT ${SOURCES})
 aktualizr_source_file_checks(${SOURCES} packagemanagerconfig.cc ${HEADERS})
@@ -12,7 +10,6 @@ aktualizr_source_file_checks(${SOURCES} packagemanagerconfig.cc ${HEADERS})
 target_sources(config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/packagemanagerconfig.cc)
 
 add_aktualizr_test(NAME packagemanagerfake SOURCES packagemanagerfake_test.cc LIBRARIES PUBLIC uptane_generator_lib)
-add_aktualizr_test(NAME raucmanager SOURCES raucmanager_test.cc NO_VALGRIND)
 
 # OSTree backend
 if(BUILD_OSTREE)
@@ -28,6 +25,14 @@ if(BUILD_OSTREE)
                        ARGS ${PROJECT_BINARY_DIR}/ostree_repo)
 endif(BUILD_OSTREE)
 
+# RAUC backend
+if(BUILD_RAUC)
+    target_sources(package_manager PRIVATE raucmanager.cc)
+    # The vtable macros of older sd-bus versions trigger missing initializer warnings.
+    set_source_files_properties(raucmanager_test.cc COMPILE_FLAGS -Wno-missing-field-initializers)
+    add_aktualizr_test(NAME raucmanager SOURCES raucmanager_test.cc NO_VALGRIND)
+endif(BUILD_RAUC)
+
 add_aktualizr_test(NAME packagemanagerconfig SOURCES packagemanagerconfig_test.cc NO_VALGRIND)
 add_aktualizr_test(NAME packagemanager_factory SOURCES packagemanagerfactory_test.cc
                    ARGS ${PROJECT_BINARY_DIR}/ostree_repo)
@@ -39,6 +44,8 @@ aktualizr_source_file_checks(fetcher_death_test.cc
                              packagemanagerconfig_test.cc
                              packagemanagerfake_test.cc
                              packagemanagerfactory_test.cc
+                             raucmanager.cc
+                             raucmanager.h
                              raucmanager_test.cc
                              ostreemanager_test.cc
                              ostreemanager.cc

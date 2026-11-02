@@ -2,20 +2,25 @@
 #define RAUCMANAGER_H_
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "libaktualizr/packagemanagerinterface.h"
 
 #include "bootloader/bootloader.h"
 
-// Installs RAUC bundles on an A/B system. RAUC writes the inactive slot and
-// arms the bootloader; the new slot is confirmed once the device has rebooted
-// into it.
+struct sd_bus;
+
+// Installs RAUC bundles on an A/B system through the RAUC D-Bus API. RAUC
+// writes the inactive slot and arms the bootloader; the new slot is confirmed
+// once the device has rebooted into it.
 class RaucManager : public PackageManagerInterface {
  public:
+  // bus and service are for tests: by default the RAUC service is reached on
+  // the system bus.
   RaucManager(const PackageConfig &pconfig, const BootloaderConfig &bconfig, const std::shared_ptr<INvStorage> &storage,
-              const std::shared_ptr<HttpInterface> &http)
-      : PackageManagerInterface(pconfig, bconfig, storage, http), bootloader_{new Bootloader(bconfig, *storage_)} {}
+              const std::shared_ptr<HttpInterface> &http, sd_bus *bus = nullptr,
+              const char *service = "de.pengutronix.rauc");
   ~RaucManager() override = default;
   RaucManager(const RaucManager &) = delete;
   RaucManager(RaucManager &&) = delete;
@@ -34,10 +39,21 @@ class RaucManager : public PackageManagerInterface {
                           const FetcherProgressCb &progress_cb, const api::FlowControlToken *token) override;
 
  private:
+  struct BusDeleter {
+    void operator()(sd_bus *bus) const;
+  };
+
   // Slot RAUC was asked to boot, kept until the update is finalized.
   boost::filesystem::path slotFile() const { return config.images_path / "rauc-slot"; }
+  sd_bus *bus() const;
+  std::string property(const char *name) const;
+  std::string primarySlot() const;
+  std::string bootedSlot() const;
 
   std::unique_ptr<Bootloader> bootloader_;
+  const char *service_;
+  mutable std::mutex mutex_;  // sd-bus connections are not thread-safe
+  mutable std::unique_ptr<sd_bus, BusDeleter> bus_;
 };
 
 #endif  // RAUCMANAGER_H_

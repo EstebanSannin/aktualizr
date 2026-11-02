@@ -39,7 +39,8 @@ if [ "${gen_buildsys_}" = "1" ] || [ ! -e "build/build.ninja" ]; then
     echo -e "\n== Generating build.ninja ==\n"
     cmake -G Ninja -S source -B build \
           -DBUILD_SOTA_TOOLS=ON \
-          -DBUILD_OSTREE=OFF
+          -DBUILD_OSTREE=OFF \
+          -DBUILD_RAUC=ON
 fi
 
 SRC_DIR=$(pwd)/source
