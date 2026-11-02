@@ -1,6 +1,7 @@
 #ifndef RAUCMANAGER_H_
 #define RAUCMANAGER_H_
 
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -14,6 +15,10 @@ struct sd_bus;
 // Installs RAUC bundles on an A/B system through the RAUC D-Bus API. RAUC
 // writes the inactive slot and arms the bootloader; the new slot is confirmed
 // once the device has rebooted into it.
+//
+// A target is identified by the manifest hash of its bundle, given in the
+// target's custom metadata as {"rauc": {"manifest-hash": "..."}}. RAUC
+// records it as the "bundle.hash" of the slot it writes.
 class RaucManager : public PackageManagerInterface {
  public:
   // bus and service are for tests: by default the RAUC service is reached on
@@ -43,12 +48,10 @@ class RaucManager : public PackageManagerInterface {
     void operator()(sd_bus *bus) const;
   };
 
-  // Slot RAUC was asked to boot, kept until the update is finalized.
-  boost::filesystem::path slotFile() const { return config.images_path / "rauc-slot"; }
   sd_bus *bus() const;
   std::string property(const char *name) const;
-  std::string primarySlot() const;
-  std::string bootedSlot() const;
+  std::map<std::string, std::string> bootedSlot() const;
+  std::string bootedHash() const;
 
   std::unique_ptr<Bootloader> bootloader_;
   const char *service_;

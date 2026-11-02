@@ -4,6 +4,7 @@
 #include <systemd/sd-bus.h>
 #include <array>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -55,37 +56,48 @@ class FakeRauc {
 
   sd_bus *client() { return client_; }
 
-  void setSlots(const std::string &booted, const std::string &primary) {
+  // The booted slot, and the manifest hash of the bundle last written to a slot
+  // (empty for a slot RAUC never wrote).
+  void setSlot(const std::string &booted, const std::string &hash) {
     std::lock_guard<std::mutex> guard(mutex_);
     booted_ = booted;
-    primary_ = primary;
+    hashes_[booted] = hash;
   }
-  void setInstallError(const std::string &error) {
+  // Manifest hash of the bundle that InstallBundle is given.
+  void setBundleHash(const std::string &hash) {
     std::lock_guard<std::mutex> guard(mutex_);
-    last_error_ = error;
+    bundle_hash_ = hash;
   }
   void setBusy() {
     std::lock_guard<std::mutex> guard(mutex_);
     busy_ = true;
   }
-  std::string bundle() {
+  // The bundle and required manifest hash InstallBundle was called with.
+  std::pair<std::string, std::string> installed() {
     std::lock_guard<std::mutex> guard(mutex_);
-    return bundle_;
+    return {bundle_, required_hash_};
   }
 
  private:
   static int installBundle(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
     auto *self = static_cast<FakeRauc *>(userdata);
     const char *source = nullptr;
-    int r = sd_bus_message_read(m, "s", &source);
+    const char *key = nullptr;
+    const char *required_hash = nullptr;
+    int r = sd_bus_message_read(m, "sa{sv}", &source, 1, &key, "s", &required_hash);
     if (r < 0) {
       return r;
+    }
+    if (std::string(key) != "require-manifest-hash") {
+      return sd_bus_error_set(ret_error, SD_BUS_ERROR_INVALID_ARGS, "Unexpected argument");
     }
     std::lock_guard<std::mutex> guard(self->mutex_);
     if (self->busy_) {
       return sd_bus_error_set(ret_error, SD_BUS_ERROR_FAILED, "Already processing a different method");
     }
     self->bundle_ = source;
+    self->required_hash_ = required_hash;
+    self->last_error_ = self->required_hash_ == self->bundle_hash_ ? "" : "Manifest hash mismatch";
     r = sd_bus_reply_method_return(m, nullptr);
     if (r < 0) {
       return r;
@@ -93,12 +105,6 @@ class FakeRauc {
     const int32_t result = self->last_error_.empty() ? 0 : 1;
     return sd_bus_emit_signal(sd_bus_message_get_bus(m), "/", "de.pengutronix.rauc.Installer", "Completed", "i",
                               result);
-  }
-
-  static int getPrimary(sd_bus_message *m, void *userdata, sd_bus_error * /* ret_error */) {
-    auto *self = static_cast<FakeRauc *>(userdata);
-    std::lock_guard<std::mutex> guard(self->mutex_);
-    return sd_bus_reply_method_return(m, "s", self->primary_.c_str());
   }
 
   static int getSlotStatus(sd_bus_message *m, void *userdata, sd_bus_error * /* ret_error */) {
@@ -111,8 +117,28 @@ class FakeRauc {
     }
     for (const char *slot : {"rootfs.0", "rootfs.1"}) {
       const char *state = slot == self->booted_ ? "booted" : "inactive";
+      const std::string &hash = self->hashes_[slot];
       if (r >= 0) {
-        r = sd_bus_message_append(reply, "(sa{sv})", slot, 2, "installed.count", "u", 1U, "state", "s", state);
+        r = sd_bus_message_open_container(reply, 'r', "sa{sv}");
+      }
+      if (r >= 0) {
+        r = sd_bus_message_append(reply, "s", slot);
+      }
+      if (r >= 0) {
+        r = sd_bus_message_open_container(reply, 'a', "{sv}");
+      }
+      if (r >= 0) {
+        r = sd_bus_message_append(reply, "{sv}{sv}", "installed.count", "u", 1U, "state", "s", state);
+      }
+      // Only a slot RAUC wrote has a bundle hash.
+      if (r >= 0 && !hash.empty()) {
+        r = sd_bus_message_append(reply, "{sv}", "bundle.hash", "s", hash.c_str());
+      }
+      if (r >= 0) {
+        r = sd_bus_message_close_container(reply);
+      }
+      if (r >= 0) {
+        r = sd_bus_message_close_container(reply);
       }
     }
     if (r >= 0) {
@@ -136,7 +162,6 @@ class FakeRauc {
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
   static constexpr sd_bus_vtable kVtable[] = {SD_BUS_VTABLE_START(0),
                                               SD_BUS_METHOD("InstallBundle", "sa{sv}", "", installBundle, 0),
-                                              SD_BUS_METHOD("GetPrimary", "", "s", getPrimary, 0),
                                               SD_BUS_METHOD("GetSlotStatus", "", "a(sa{sv})", getSlotStatus, 0),
                                               SD_BUS_PROPERTY("LastError", "s", getString, 0, 0),
                                               SD_BUS_PROPERTY("Operation", "s", getString, 0, 0),
@@ -149,11 +174,27 @@ class FakeRauc {
   std::thread thread_;
   std::mutex mutex_;
   std::string booted_{"rootfs.0"};
-  std::string primary_{"rootfs.1"};
+  std::map<std::string, std::string> hashes_;
+  std::string bundle_hash_{"new"};
   std::string last_error_;
   std::string bundle_;
+  std::string required_hash_;
   bool busy_{false};
 };
+
+static Json::Value targetJson(const std::string &manifest_hash) {
+  Json::Value target_json;
+  target_json["hashes"]["sha256"] = "D9CD8155764C3543F10FAD8A480D743137466F8D55213C8EAEFCD12F06D43A80";
+  target_json["length"] = 1;
+  if (!manifest_hash.empty()) {
+    target_json["custom"]["rauc"]["manifest-hash"] = manifest_hash;
+  }
+  return target_json;
+}
+
+static Uptane::Target makeTarget(const std::string &name, const std::string &manifest_hash) {
+  return Uptane::Target(name, targetJson(manifest_hash));
+}
 
 class RaucManagerTest : public ::testing::Test {
  protected:
@@ -165,11 +206,7 @@ class RaucManagerTest : public ::testing::Test {
     storage_ = INvStorage::newStorage(config_.storage);
     pacman_ =
         std::make_unique<RaucManager>(config_.pacman, config_.bootloader, storage_, nullptr, rauc_.client(), nullptr);
-
-    Json::Value target_json;
-    target_json["hashes"]["sha256"] = "D9CD8155764C3543F10FAD8A480D743137466F8D55213C8EAEFCD12F06D43A80";
-    target_json["length"] = 1;
-    target_ = Uptane::Target("bundle.raucb", target_json);
+    rauc_.setSlot("rootfs.0", "old");
   }
 
   void download() { pacman_->createTargetFile(target_) << "a"; }
@@ -183,17 +220,18 @@ class RaucManagerTest : public ::testing::Test {
   Config config_;
   std::shared_ptr<INvStorage> storage_;
   std::unique_ptr<RaucManager> pacman_;
-  Uptane::Target target_{Uptane::Target::Unknown()};
+  Uptane::Target target_{makeTarget("new.raucb", "new")};
 };
 
 TEST_F(RaucManagerTest, InstallAndFinalize) {
   download();
   EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kNeedCompletion);
-  EXPECT_EQ(rauc_.bundle(), pacman_->checkTargetFile(target_)->second);
+  EXPECT_EQ(rauc_.installed().first, pacman_->checkTargetFile(target_)->second);
+  EXPECT_EQ(rauc_.installed().second, "new");
   EXPECT_EQ(pacman_->finalizeInstall(target_).result_code, data::ResultCode::Numeric::kNeedCompletion);
 
   reboot();
-  rauc_.setSlots("rootfs.1", "rootfs.1");
+  rauc_.setSlot("rootfs.1", "new");
   EXPECT_EQ(pacman_->finalizeInstall(target_).result_code, data::ResultCode::Numeric::kOk);
 }
 
@@ -203,16 +241,31 @@ TEST_F(RaucManagerTest, Rollback) {
 
   // The new slot ran out of boot attempts and the bootloader went back to the old one.
   reboot();
-  rauc_.setSlots("rootfs.0", "rootfs.0");
   EXPECT_EQ(pacman_->finalizeInstall(target_).result_code, data::ResultCode::Numeric::kInstallFailed);
 }
 
-TEST_F(RaucManagerTest, InstallFailure) {
+TEST_F(RaucManagerTest, ManifestHashMismatch) {
   download();
-  rauc_.setInstallError("Failed updating slot rootfs.1");
+  rauc_.setBundleHash("other");
   const auto result = pacman_->install(target_);
   EXPECT_EQ(result.result_code, data::ResultCode::Numeric::kInstallFailed);
-  EXPECT_EQ(result.description, "Failed updating slot rootfs.1");
+  EXPECT_EQ(result.description, "Manifest hash mismatch");
+}
+
+TEST_F(RaucManagerTest, NoManifestHash) {
+  target_ = makeTarget("new.raucb", "");
+  download();
+  EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kInstallFailed);
+  EXPECT_TRUE(rauc_.installed().first.empty());
+}
+
+// A power cut after RAUC armed the new slot but before aktualizr recorded the
+// pending update: the device runs the target without aktualizr knowing.
+TEST_F(RaucManagerTest, AlreadyRunning) {
+  download();
+  rauc_.setSlot("rootfs.1", "new");
+  EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kOk);
+  EXPECT_TRUE(rauc_.installed().first.empty());
 }
 
 TEST_F(RaucManagerTest, Busy) {
@@ -225,6 +278,32 @@ TEST_F(RaucManagerTest, Busy) {
 
 TEST_F(RaucManagerTest, MissingBundle) {
   EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kInstallFailed);
+}
+
+TEST_F(RaucManagerTest, CurrentFromStorage) {
+  const auto old_target = makeTarget("old.raucb", "old");
+  storage_->savePrimaryInstalledVersion(old_target, InstalledVersionUpdateMode::kCurrent, "");
+  EXPECT_EQ(pacman_->getCurrent().filename(), "old.raucb");
+
+  // A slot RAUC never wrote, as on a freshly flashed device.
+  rauc_.setSlot("rootfs.0", "");
+  EXPECT_EQ(pacman_->getCurrent().filename(), "old.raucb");
+}
+
+TEST_F(RaucManagerTest, CurrentFromBootedSlot) {
+  storage_->savePrimaryInstalledVersion(makeTarget("old.raucb", "old"), InstalledVersionUpdateMode::kCurrent, "");
+  Json::Value targets;
+  targets["signed"]["_type"] = "Targets";
+  targets["signed"]["version"] = 1;
+  targets["signed"]["expires"] = "2038-01-19T03:14:06Z";
+  targets["signed"]["targets"]["new.raucb"] = targetJson("new");
+  storage_->storeNonRoot(Utils::jsonToStr(targets), Uptane::RepositoryType::Image(), Uptane::Role::Targets());
+
+  rauc_.setSlot("rootfs.1", "new");
+  EXPECT_EQ(pacman_->getCurrent().filename(), "new.raucb");
+
+  rauc_.setSlot("rootfs.1", "unknown");
+  EXPECT_FALSE(pacman_->getCurrent().IsValid());
 }
 
 #ifndef __NO_MAIN__
