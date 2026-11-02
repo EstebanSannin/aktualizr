@@ -190,15 +190,20 @@ Uptane::Target RaucManager::getCurrent() const {
 }
 
 data::InstallationResult RaucManager::install(const Uptane::Target &target) const {
+  // aktualizr flags a trial boot (updateNotify) before installing. RAUC arms the
+  // bootloader only once the slot is written, so on failure clear the flag again.
+  const auto failed = [this](const std::string &description) {
+    bootloader_->setBootOK();
+    return data::InstallationResult(data::ResultCode::Numeric::kInstallFailed, description);
+  };
+
   const std::string manifest_hash = manifestHash(target);
   if (manifest_hash.empty()) {
-    return data::InstallationResult(data::ResultCode::Numeric::kInstallFailed,
-                                    "Target " + target.filename() + " has no RAUC manifest hash");
+    return failed("Target " + target.filename() + " has no RAUC manifest hash");
   }
   auto bundle = checkTargetFile(target);
   if (!bundle) {
-    return data::InstallationResult(data::ResultCode::Numeric::kInstallFailed,
-                                    "Bundle not found for target " + target.filename());
+    return failed("Bundle not found for target " + target.filename());
   }
 
   // After a power cut between RAUC arming the new slot and aktualizr recording
@@ -253,11 +258,11 @@ data::InstallationResult RaucManager::install(const Uptane::Target &target) cons
     if (*result != 0) {
       const std::string last_error = property("LastError");
       LOG_ERROR << "RAUC installation failed: " << last_error;
-      return data::InstallationResult(data::ResultCode::Numeric::kInstallFailed, last_error);
+      return failed(last_error);
     }
   } catch (const std::exception &e) {
     LOG_ERROR << e.what();
-    return data::InstallationResult(data::ResultCode::Numeric::kInstallFailed, e.what());
+    return failed(e.what());
   }
 
   bootloader_->rebootFlagSet();
