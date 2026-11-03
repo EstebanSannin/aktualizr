@@ -1,8 +1,13 @@
 #include "raucmanager.h"
 
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 #include <systemd/sd-bus.h>
 #include <unistd.h>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <system_error>
 
 #include <boost/optional.hpp>
@@ -21,6 +26,7 @@ AUTO_REGISTER_PACKAGE_MANAGER(PACKAGE_MANAGER_RAUC, RaucManager);
 
 static constexpr const char *kPath = "/";
 static constexpr const char *kInterface = "de.pengutronix.rauc.Installer";
+static constexpr const char *kKeyringDir = "/run/rauc/keyring.d";
 // How long to wait for the Completed signal before checking that RAUC is still installing.
 static constexpr uint64_t kInstallPollUsec = uint64_t{10} * 1000 * 1000;
 
@@ -45,6 +51,55 @@ struct MessageDeleter {
 struct SlotDeleter {
   void operator()(sd_bus_slot *s) const { sd_bus_slot_unref(s); }
 };
+
+// Certificates put in RAUC's keyring directory for one installation, and removed
+// afterwards. RAUC reads the directory at every installation, looking
+// certificates up by their subject hash.
+class Keyring {
+ public:
+  explicit Keyring(boost::filesystem::path dir) : dir_{std::move(dir)} {}
+  ~Keyring() {
+    for (const auto &file : files_) {
+      boost::system::error_code ec;
+      boost::filesystem::remove(file, ec);
+    }
+  }
+  Keyring(const Keyring &) = delete;
+  Keyring(Keyring &&) = delete;
+  Keyring &operator=(const Keyring &) = delete;
+  Keyring &operator=(Keyring &&) = delete;
+
+  void add(const std::string &pem) {
+    boost::filesystem::create_directories(dir_);
+    StructGuard<BIO> in(BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())), BIO_vfree);
+    std::map<unsigned long, int> count;  // NOLINT(google-runtime-int)
+    while (true) {
+      StructGuard<X509> cert(PEM_read_bio_X509(in.get(), nullptr, nullptr, nullptr), X509_free);
+      if (!cert) {
+        break;
+      }
+      StructGuard<BIO> out(BIO_new(BIO_s_mem()), BIO_vfree);
+      char *data = nullptr;
+      if (PEM_write_bio_X509(out.get(), cert.get()) == 0) {
+        throw std::runtime_error("Could not write a RAUC keyring certificate");
+      }
+      const auto size = static_cast<size_t>(BIO_get_mem_data(out.get(), &data));
+      const auto hash = X509_subject_name_hash(cert.get());
+      std::ostringstream name;
+      name << std::hex << std::setw(8) << std::setfill('0') << hash << '.' << std::dec << count[hash]++;
+      files_.push_back(dir_ / name.str());
+      Utils::writeFile(files_.back(), data, size);
+    }
+    ERR_clear_error();  // the end of the PEM data
+    if (count.empty()) {
+      throw std::runtime_error("The RAUC keyring in the target metadata has no certificate");
+    }
+  }
+
+ private:
+  boost::filesystem::path dir_;
+  std::vector<boost::filesystem::path> files_;
+};
 }  // namespace
 
 static std::string manifestHash(const Uptane::Target &target) {
@@ -64,6 +119,7 @@ RaucManager::RaucManager(const PackageConfig &pconfig, const BootloaderConfig &b
                          const std::shared_ptr<INvStorage> &storage, const std::shared_ptr<HttpInterface> &http,
                          sd_bus *bus, const char *service)
     : PackageManagerInterface(pconfig, bconfig, storage, http),
+      keyring_dir_{pconfig.extra.count("rauc_keyring_dir") != 0 ? pconfig.extra.at("rauc_keyring_dir") : kKeyringDir},
       bootloader_{new Bootloader(bconfig, *storage_)},
       service_{service},
       bus_{bus != nullptr ? sd_bus_ref(bus) : nullptr} {}
@@ -197,15 +253,15 @@ std::vector<Uptane::Target> RaucManager::imageTargets() const {
 }
 
 // The manifest hash is all that binds a streamed bundle to the Uptane metadata,
-// so take it from the Image repo: the Director's custom metadata wins when the
-// two are merged.
-std::string RaucManager::imageManifestHash(const Uptane::Target &target) const {
+// so take it, and the keyring, from the Image repo: the Director's custom
+// metadata wins when the two are merged.
+Json::Value RaucManager::imageRaucMetadata(const Uptane::Target &target) const {
   for (const auto &image_target : imageTargets()) {
     if (image_target.MatchTarget(target)) {
-      return manifestHash(image_target);
+      return image_target.custom_data()["rauc"];
     }
   }
-  return "";
+  return Json::Value();
 }
 
 // The repository redirects to a pre-signed URL. Resolve it with aktualizr's TLS
@@ -231,7 +287,8 @@ data::InstallationResult RaucManager::install(const Uptane::Target &target) cons
     return data::InstallationResult(data::ResultCode::Numeric::kInstallFailed, description);
   };
 
-  const std::string manifest_hash = imageManifestHash(target);
+  const Json::Value rauc = imageRaucMetadata(target);
+  const std::string manifest_hash = rauc["manifest-hash"].asString();
   if (manifest_hash.empty()) {
     return failed("Target " + target.filename() + " has no RAUC manifest hash in the Image repo metadata");
   }
@@ -256,6 +313,11 @@ data::InstallationResult RaucManager::install(const Uptane::Target &target) cons
   std::lock_guard<std::mutex> guard(mutex_);
   LOG_INFO << "Installing " << target.filename() << " with RAUC from " << Utils::redactUrlQueryStrings(bundle) << "...";
   try {
+    Keyring keyring(keyring_dir_);
+    if (rauc.isMember("keyring")) {
+      keyring.add(rauc["keyring"].asString());
+    }
+
     // Subscribe before starting the installation, so that the signal cannot be missed.
     boost::optional<int32_t> result;
     sd_bus_slot *slot = nullptr;

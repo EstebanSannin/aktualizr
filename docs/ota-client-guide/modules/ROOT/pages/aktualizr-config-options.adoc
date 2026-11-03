@@ -147,6 +147,7 @@ Options for package management and update installation. Note that this only coin
 | `packages_file`    | `"/usr/package.manifest"` | Path to a file for storing package manifest information. Only used with `ostree`.
 | `images_path`      | `"/var/sota/images"`      | Directory to store downloaded binary Targets. Only used with `none`.
 | `fake_need_reboot` | false                     | Simulate a wait-for-reboot with the `"none"` package manager. Used for testing.
+| `rauc_keyring_dir` | `"/run/rauc/keyring.d"`   | Where the certificates a target carries for its bundle signature are put while it installs. Must be RAUC's `[keyring] directory`. Only used with `rauc`.
 |==========================================================================================
 
 === `storage`

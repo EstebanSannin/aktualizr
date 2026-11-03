@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <boost/filesystem.hpp>
+
 #include "libaktualizr/packagemanagerinterface.h"
 
 #include "bootloader/bootloader.h"
@@ -20,6 +22,13 @@ struct sd_bus;
 // A target is identified by the manifest hash of its bundle, given in the
 // target's custom metadata as {"rauc": {"manifest-hash": "..."}}. RAUC
 // records it as the "bundle.hash" of the slot it writes.
+//
+// RAUC checks the signature of every bundle, and on the Uptane path a bundle is
+// trusted on its manifest hash alone. So the target may carry the certificates
+// its signature chains to, as {"rauc": {"keyring": "<PEM>"}}; they are put in
+// RAUC's keyring directory for the installation. The directory is set by
+// rauc_keyring_dir in [pacman] (/run/rauc/keyring.d by default) and must be
+// RAUC's [keyring] directory.
 //
 // Bundles are not downloaded: RAUC streams them from the repository while
 // installing. Offline updates install the bundle from the local copy.
@@ -63,11 +72,12 @@ class RaucManager : public PackageManagerInterface {
   std::map<std::string, std::string> bootedSlot() const;
   std::string bootedHash() const;
   std::vector<Uptane::Target> imageTargets() const;
-  std::string imageManifestHash(const Uptane::Target &target) const;
+  Json::Value imageRaucMetadata(const Uptane::Target &target) const;
   std::string bundleUrl(const Uptane::Target &target) const;
 
   // Set by an online fetch: the bundle is then streamed from this repository.
   std::string repo_server_;
+  boost::filesystem::path keyring_dir_;
   std::unique_ptr<Bootloader> bootloader_;
   const char *service_;
   mutable std::mutex mutex_;  // sd-bus connections are not thread-safe

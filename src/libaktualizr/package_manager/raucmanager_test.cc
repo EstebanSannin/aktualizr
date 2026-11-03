@@ -1,17 +1,21 @@
 #include <gtest/gtest.h>
 
+#include <openssl/x509.h>
 #include <sys/socket.h>
 #include <systemd/sd-bus.h>
 #include <array>
 #include <atomic>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 
 #include <boost/filesystem.hpp>
 
+#include "crypto/crypto.h"
 #include "crypto/keymanager.h"
 #include "httpfake.h"
 #include "libaktualizr/config.h"
@@ -80,6 +84,15 @@ class FakeRauc {
     std::lock_guard<std::mutex> guard(mutex_);
     return {bundle_, required_hash_};
   }
+  void setKeyringDir(const boost::filesystem::path &dir) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    keyring_dir_ = dir;
+  }
+  // The files in the keyring directory when InstallBundle was called.
+  std::map<std::string, std::string> keyring() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return keyring_;
+  }
 
  private:
   static int installBundle(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
@@ -100,6 +113,11 @@ class FakeRauc {
     }
     self->bundle_ = source;
     self->required_hash_ = required_hash;
+    if (boost::filesystem::is_directory(self->keyring_dir_)) {
+      for (const auto &file : boost::filesystem::directory_iterator(self->keyring_dir_)) {
+        self->keyring_[file.path().filename().string()] = Utils::readFile(file.path());
+      }
+    }
     self->last_error_ = self->required_hash_ == self->bundle_hash_ ? "" : "Manifest hash mismatch: " + self->bundle_;
     r = sd_bus_reply_method_return(m, nullptr);
     if (r < 0) {
@@ -183,16 +201,32 @@ class FakeRauc {
   std::string bundle_;
   std::string required_hash_;
   bool busy_{false};
+  boost::filesystem::path keyring_dir_;
+  std::map<std::string, std::string> keyring_;
 };
 
-static Json::Value targetJson(const std::string &manifest_hash) {
+static Json::Value targetJson(const std::string &manifest_hash, const std::string &keyring = "") {
   Json::Value target_json;
   target_json["hashes"]["sha256"] = "D9CD8155764C3543F10FAD8A480D743137466F8D55213C8EAEFCD12F06D43A80";
   target_json["length"] = 1;
   if (!manifest_hash.empty()) {
     target_json["custom"]["rauc"]["manifest-hash"] = manifest_hash;
   }
+  if (!keyring.empty()) {
+    target_json["custom"]["rauc"]["keyring"] = keyring;
+  }
   return target_json;
+}
+
+// A self-signed certificate in PEM, and its name in a hashed keyring directory.
+static std::pair<std::string, std::string> makeCert(const std::string &cn, int index = 0) {
+  const auto cert = Crypto::generateCert(2048, 1, "", "", "", cn, true);
+  std::string pkey;
+  std::string pem;
+  Crypto::serializeCert(&pkey, &pem, cert.get());
+  std::ostringstream name;
+  name << std::hex << std::setw(8) << std::setfill('0') << X509_subject_name_hash(cert.get()) << '.' << index;
+  return {pem, name.str()};
 }
 
 static Uptane::Target makeTarget(const std::string &name, const std::string &manifest_hash) {
@@ -218,6 +252,8 @@ class RaucManagerTest : public ::testing::Test {
     config_.pacman.images_path = temp_dir_.Path() / "images";
     config_.bootloader.reboot_sentinel_dir = temp_dir_.Path();
     config_.storage.path = temp_dir_.Path();
+    config_.pacman.extra["rauc_keyring_dir"] = keyring_dir_.string();
+    rauc_.setKeyringDir(keyring_dir_);
     storage_ = INvStorage::newStorage(config_.storage);
     pacman_ =
         std::make_unique<RaucManager>(config_.pacman, config_.bootloader, storage_, http_, rauc_.client(), nullptr);
@@ -226,11 +262,11 @@ class RaucManagerTest : public ::testing::Test {
   }
 
   // Adds a target to the Image repo Targets metadata.
-  void publish(const std::string &name, const std::string &manifest_hash) {
+  void publish(const std::string &name, const std::string &manifest_hash, const std::string &keyring = "") {
     image_targets_["signed"]["_type"] = "Targets";
     image_targets_["signed"]["version"] = 1;
     image_targets_["signed"]["expires"] = "2038-01-19T03:14:06Z";
-    image_targets_["signed"]["targets"][name] = targetJson(manifest_hash);
+    image_targets_["signed"]["targets"][name] = targetJson(manifest_hash, keyring);
     storage_->storeNonRoot(Utils::jsonToStr(image_targets_), Uptane::RepositoryType::Image(), Uptane::Role::Targets());
   }
 
@@ -247,6 +283,7 @@ class RaucManagerTest : public ::testing::Test {
   }
 
   TemporaryDirectory temp_dir_;
+  boost::filesystem::path keyring_dir_{temp_dir_.Path() / "keyring"};
   FakeRauc rauc_;
   Config config_;
   std::shared_ptr<RedirectingHttp> http_{std::make_shared<RedirectingHttp>(temp_dir_.Path())};
@@ -310,12 +347,34 @@ TEST_F(RaucManagerTest, Busy) {
 }
 
 // The Director's custom metadata takes precedence over the Image repo's, but
-// cannot choose the bundle.
+// cannot choose the bundle or the keyring.
 TEST_F(RaucManagerTest, ManifestHashFromImageRepo) {
-  target_ = makeTarget("new.raucb", "director");
+  target_ = Uptane::Target("new.raucb", targetJson("director", "director"));
   download();
   EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kNeedCompletion);
   EXPECT_EQ(rauc_.installed().second, "new");
+  EXPECT_TRUE(rauc_.keyring().empty());
+}
+
+// The certificates the target carries are in RAUC's keyring only while it installs.
+TEST_F(RaucManagerTest, Keyring) {
+  const auto first = makeCert("bundle-signing");
+  const auto second = makeCert("bundle-signing", 1);
+  publish("new.raucb", "new", first.first + second.first);
+  download();
+  EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kNeedCompletion);
+  const std::map<std::string, std::string> expected{{first.second, first.first}, {second.second, second.first}};
+  EXPECT_EQ(rauc_.keyring(), expected);
+  EXPECT_TRUE(boost::filesystem::is_empty(keyring_dir_));
+}
+
+TEST_F(RaucManagerTest, InvalidKeyring) {
+  publish("new.raucb", "new", "not a certificate");
+  download();
+  const auto result = pacman_->install(target_);
+  EXPECT_EQ(result.result_code, data::ResultCode::Numeric::kInstallFailed);
+  EXPECT_EQ(result.description, "The RAUC keyring in the target metadata has no certificate");
+  EXPECT_TRUE(rauc_.installed().first.empty());
 }
 
 TEST_F(RaucManagerTest, Streaming) {
