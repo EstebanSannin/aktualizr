@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "libaktualizr/packagemanagerinterface.h"
 
@@ -19,6 +20,9 @@ struct sd_bus;
 // A target is identified by the manifest hash of its bundle, given in the
 // target's custom metadata as {"rauc": {"manifest-hash": "..."}}. RAUC
 // records it as the "bundle.hash" of the slot it writes.
+//
+// Bundles are not downloaded: RAUC streams them from the repository while
+// installing. Offline updates install the bundle from the local copy.
 class RaucManager : public PackageManagerInterface {
  public:
   // bus and service are for tests: by default the RAUC service is reached on
@@ -42,6 +46,12 @@ class RaucManager : public PackageManagerInterface {
   void updateNotify() override { bootloader_->updateNotify(); }
   FetchResult fetchTarget(const Uptane::Target &target, Uptane::Fetcher &fetcher, const KeyManager &keys,
                           const FetcherProgressCb &progress_cb, const api::FlowControlToken *token) override;
+#ifdef BUILD_OFFLINE_UPDATES
+  FetchResult fetchTargetOffUpd(const Uptane::Target &target, const Uptane::OfflineUpdateFetcher &fetcher,
+                                const KeyManager &keys, const FetcherProgressCb &progress_cb,
+                                const api::FlowControlToken *token) override;
+#endif
+  TargetStatus verifyTarget(const Uptane::Target &target) const override;
 
  private:
   struct BusDeleter {
@@ -52,7 +62,12 @@ class RaucManager : public PackageManagerInterface {
   std::string property(const char *name) const;
   std::map<std::string, std::string> bootedSlot() const;
   std::string bootedHash() const;
+  std::vector<Uptane::Target> imageTargets() const;
+  std::string imageManifestHash(const Uptane::Target &target) const;
+  std::string bundleUrl(const Uptane::Target &target) const;
 
+  // Set by an online fetch: the bundle is then streamed from this repository.
+  std::string repo_server_;
   std::unique_ptr<Bootloader> bootloader_;
   const char *service_;
   mutable std::mutex mutex_;  // sd-bus connections are not thread-safe

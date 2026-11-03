@@ -12,9 +12,12 @@
 
 #include <boost/filesystem.hpp>
 
+#include "crypto/keymanager.h"
+#include "httpfake.h"
 #include "libaktualizr/config.h"
 #include "package_manager/raucmanager.h"
 #include "storage/invstorage.h"
+#include "uptane/fetcher.h"
 #include "utilities/utils.h"
 
 // Fake RAUC service. It serves the Installer interface on one end of a socket
@@ -97,7 +100,7 @@ class FakeRauc {
     }
     self->bundle_ = source;
     self->required_hash_ = required_hash;
-    self->last_error_ = self->required_hash_ == self->bundle_hash_ ? "" : "Manifest hash mismatch";
+    self->last_error_ = self->required_hash_ == self->bundle_hash_ ? "" : "Manifest hash mismatch: " + self->bundle_;
     r = sd_bus_reply_method_return(m, nullptr);
     if (r < 0) {
       return r;
@@ -196,6 +199,18 @@ static Uptane::Target makeTarget(const std::string &name, const std::string &man
   return Uptane::Target(name, targetJson(manifest_hash));
 }
 
+// The repository redirects every bundle to a pre-signed URL.
+class RedirectingHttp : public HttpFake {
+ public:
+  using HttpFake::HttpFake;
+  std::string getEffectiveUrl(const std::string &url) override {
+    requested = url;
+    return "https://cdn.example/new.raucb?signature=secret";
+  }
+
+  std::string requested;
+};
+
 class RaucManagerTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -205,11 +220,27 @@ class RaucManagerTest : public ::testing::Test {
     config_.storage.path = temp_dir_.Path();
     storage_ = INvStorage::newStorage(config_.storage);
     pacman_ =
-        std::make_unique<RaucManager>(config_.pacman, config_.bootloader, storage_, nullptr, rauc_.client(), nullptr);
+        std::make_unique<RaucManager>(config_.pacman, config_.bootloader, storage_, http_, rauc_.client(), nullptr);
     rauc_.setSlot("rootfs.0", "old");
+    publish("new.raucb", "new");
+  }
+
+  // Adds a target to the Image repo Targets metadata.
+  void publish(const std::string &name, const std::string &manifest_hash) {
+    image_targets_["signed"]["_type"] = "Targets";
+    image_targets_["signed"]["version"] = 1;
+    image_targets_["signed"]["expires"] = "2038-01-19T03:14:06Z";
+    image_targets_["signed"]["targets"][name] = targetJson(manifest_hash);
+    storage_->storeNonRoot(Utils::jsonToStr(image_targets_), Uptane::RepositoryType::Image(), Uptane::Role::Targets());
   }
 
   void download() { pacman_->createTargetFile(target_) << "a"; }
+
+  void fetch() {
+    Uptane::Fetcher fetcher("https://repo.example", "", http_);
+    KeyManager keys(storage_, config_.keymanagerConfig());
+    EXPECT_TRUE(pacman_->fetchTarget(target_, fetcher, keys, nullptr, nullptr));
+  }
 
   void reboot() {
     boost::filesystem::remove(config_.bootloader.reboot_sentinel_dir / config_.bootloader.reboot_sentinel_name);
@@ -218,7 +249,9 @@ class RaucManagerTest : public ::testing::Test {
   TemporaryDirectory temp_dir_;
   FakeRauc rauc_;
   Config config_;
+  std::shared_ptr<RedirectingHttp> http_{std::make_shared<RedirectingHttp>(temp_dir_.Path())};
   std::shared_ptr<INvStorage> storage_;
+  Json::Value image_targets_;
   std::unique_ptr<RaucManager> pacman_;
   Uptane::Target target_{makeTarget("new.raucb", "new")};
 };
@@ -249,11 +282,11 @@ TEST_F(RaucManagerTest, ManifestHashMismatch) {
   rauc_.setBundleHash("other");
   const auto result = pacman_->install(target_);
   EXPECT_EQ(result.result_code, data::ResultCode::Numeric::kInstallFailed);
-  EXPECT_EQ(result.description, "Manifest hash mismatch");
+  EXPECT_EQ(result.description, "Manifest hash mismatch: " + pacman_->checkTargetFile(target_)->second);
 }
 
 TEST_F(RaucManagerTest, NoManifestHash) {
-  target_ = makeTarget("new.raucb", "");
+  publish("new.raucb", "");
   download();
   EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kInstallFailed);
   EXPECT_TRUE(rauc_.installed().first.empty());
@@ -276,6 +309,33 @@ TEST_F(RaucManagerTest, Busy) {
   EXPECT_NE(result.description.find("Already processing"), std::string::npos);
 }
 
+// The Director's custom metadata takes precedence over the Image repo's, but
+// cannot choose the bundle.
+TEST_F(RaucManagerTest, ManifestHashFromImageRepo) {
+  target_ = makeTarget("new.raucb", "director");
+  download();
+  EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kNeedCompletion);
+  EXPECT_EQ(rauc_.installed().second, "new");
+}
+
+TEST_F(RaucManagerTest, Streaming) {
+  fetch();
+  EXPECT_FALSE(pacman_->checkTargetFile(target_));
+  EXPECT_EQ(pacman_->verifyTarget(target_), TargetStatus::kGood);
+  EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kNeedCompletion);
+  EXPECT_EQ(http_->requested, "https://repo.example/targets/new.raucb");
+  EXPECT_EQ(rauc_.installed().first, "https://cdn.example/new.raucb?signature=secret");
+}
+
+// The pre-signed URL does not leak into the installation report.
+TEST_F(RaucManagerTest, StreamingFailure) {
+  fetch();
+  rauc_.setBundleHash("other");
+  const auto result = pacman_->install(target_);
+  EXPECT_EQ(result.result_code, data::ResultCode::Numeric::kInstallFailed);
+  EXPECT_EQ(result.description, "Manifest hash mismatch: https://cdn.example/new.raucb");
+}
+
 TEST_F(RaucManagerTest, MissingBundle) {
   EXPECT_EQ(pacman_->install(target_).result_code, data::ResultCode::Numeric::kInstallFailed);
 }
@@ -292,13 +352,6 @@ TEST_F(RaucManagerTest, CurrentFromStorage) {
 
 TEST_F(RaucManagerTest, CurrentFromBootedSlot) {
   storage_->savePrimaryInstalledVersion(makeTarget("old.raucb", "old"), InstalledVersionUpdateMode::kCurrent, "");
-  Json::Value targets;
-  targets["signed"]["_type"] = "Targets";
-  targets["signed"]["version"] = 1;
-  targets["signed"]["expires"] = "2038-01-19T03:14:06Z";
-  targets["signed"]["targets"]["new.raucb"] = targetJson("new");
-  storage_->storeNonRoot(Utils::jsonToStr(targets), Uptane::RepositoryType::Image(), Uptane::Role::Targets());
-
   rauc_.setSlot("rootfs.1", "new");
   EXPECT_EQ(pacman_->getCurrent().filename(), "new.raucb");
 

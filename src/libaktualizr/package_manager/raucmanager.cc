@@ -9,8 +9,10 @@
 
 #include "libaktualizr/packagemanagerfactory.h"
 
+#include "http/httpinterface.h"
 #include "logging/logging.h"
 #include "storage/invstorage.h"
+#include "uptane/fetcher.h"
 #include "uptane/tuf.h"
 #include "utilities/utils.h"
 
@@ -178,32 +180,60 @@ Uptane::Target RaucManager::getCurrent() const {
   // between the installation and aktualizr recording it. Look the booted
   // bundle up in the Image repo Targets metadata.
   LOG_WARNING << "Current version in storage does not match the booted RAUC slot";
-  std::string targets;
-  if (storage_->loadNonRoot(&targets, Uptane::RepositoryType::Image(), Uptane::Role::Targets())) {
-    for (const auto &target : Uptane::Targets(Utils::parseJSON(targets)).targets) {
-      if (manifestHash(target) == booted_hash) {
-        return target;
-      }
+  for (const auto &target : imageTargets()) {
+    if (manifestHash(target) == booted_hash) {
+      return target;
     }
   }
   return Uptane::Target::Unknown();
 }
 
+std::vector<Uptane::Target> RaucManager::imageTargets() const {
+  std::string targets;
+  if (!storage_->loadNonRoot(&targets, Uptane::RepositoryType::Image(), Uptane::Role::Targets())) {
+    return {};
+  }
+  return Uptane::Targets(Utils::parseJSON(targets)).targets;
+}
+
+// The manifest hash is all that binds a streamed bundle to the Uptane metadata,
+// so take it from the Image repo: the Director's custom metadata wins when the
+// two are merged.
+std::string RaucManager::imageManifestHash(const Uptane::Target &target) const {
+  for (const auto &image_target : imageTargets()) {
+    if (image_target.MatchTarget(target)) {
+      return manifestHash(image_target);
+    }
+  }
+  return "";
+}
+
+// The repository redirects to a pre-signed URL. Resolve it with aktualizr's TLS
+// client certificate: the pre-signed URL needs none, so RAUC's unprivileged
+// streaming helper can read it.
+std::string RaucManager::bundleUrl(const Uptane::Target &target) const {
+  std::string url = target.uri();
+  if (url.empty()) {
+    url = repo_server_ + "/targets/" + Utils::urlEncode(target.filename());
+  }
+  const std::string resolved = http_->getEffectiveUrl(url);
+  return resolved.empty() ? url : resolved;
+}
+
 data::InstallationResult RaucManager::install(const Uptane::Target &target) const {
   // aktualizr flags a trial boot (updateNotify) before installing. RAUC arms the
   // bootloader only once the slot is written, so on failure clear the flag again.
-  const auto failed = [this](const std::string &description) {
+  // Pre-signed URLs are credentials and must not reach the report.
+  const auto failed = [this](const std::string &error) {
+    const std::string description = Utils::redactUrlQueryStrings(error);
+    LOG_ERROR << "RAUC installation failed: " << description;
     bootloader_->setBootOK();
     return data::InstallationResult(data::ResultCode::Numeric::kInstallFailed, description);
   };
 
-  const std::string manifest_hash = manifestHash(target);
+  const std::string manifest_hash = imageManifestHash(target);
   if (manifest_hash.empty()) {
-    return failed("Target " + target.filename() + " has no RAUC manifest hash");
-  }
-  auto bundle = checkTargetFile(target);
-  if (!bundle) {
-    return failed("Bundle not found for target " + target.filename());
+    return failed("Target " + target.filename() + " has no RAUC manifest hash in the Image repo metadata");
   }
 
   // After a power cut between RAUC arming the new slot and aktualizr recording
@@ -214,8 +244,17 @@ data::InstallationResult RaucManager::install(const Uptane::Target &target) cons
     return data::InstallationResult(data::ResultCode::Numeric::kOk, "Target is already running");
   }
 
+  std::string bundle;
+  if (!repo_server_.empty()) {
+    bundle = bundleUrl(target);
+  } else if (auto file = checkTargetFile(target)) {
+    bundle = file->second;
+  } else {
+    return failed("Bundle not found for target " + target.filename());
+  }
+
   std::lock_guard<std::mutex> guard(mutex_);
-  LOG_INFO << "Installing " << target.filename() << " with RAUC...";
+  LOG_INFO << "Installing " << target.filename() << " with RAUC from " << Utils::redactUrlQueryStrings(bundle) << "...";
   try {
     // Subscribe before starting the installation, so that the signal cannot be missed.
     boost::optional<int32_t> result;
@@ -229,7 +268,7 @@ data::InstallationResult RaucManager::install(const Uptane::Target &target) cons
     // RAUC refuses a bundle whose manifest is not the one the target describes.
     BusError error;
     r = sd_bus_call_method(bus(), service_, kPath, kInterface, "InstallBundle", &error.error, nullptr, "sa{sv}",
-                           bundle->second.c_str(), 1, "require-manifest-hash", "s", manifest_hash.c_str());
+                           bundle.c_str(), 1, "require-manifest-hash", "s", manifest_hash.c_str());
     if (r < 0) {
       throw std::runtime_error("RAUC did not start the installation: " + error.message(r));
     }
@@ -256,12 +295,9 @@ data::InstallationResult RaucManager::install(const Uptane::Target &target) cons
     }
 
     if (*result != 0) {
-      const std::string last_error = property("LastError");
-      LOG_ERROR << "RAUC installation failed: " << last_error;
-      return failed(last_error);
+      return failed(property("LastError"));
     }
   } catch (const std::exception &e) {
-    LOG_ERROR << e.what();
     return failed(e.what());
   }
 
@@ -299,14 +335,35 @@ data::InstallationResult RaucManager::finalizeInstall(const Uptane::Target &targ
 }
 
 PackageManagerInterface::FetchResult RaucManager::fetchTarget(const Uptane::Target &target, Uptane::Fetcher &fetcher,
-                                                              const KeyManager &keys,
-                                                              const FetcherProgressCb &progress_cb,
-                                                              const api::FlowControlToken *token) {
+                                                              const KeyManager & /* keys */,
+                                                              const FetcherProgressCb & /* progress_cb */,
+                                                              const api::FlowControlToken * /* token */) {
   if (target.IsOstree()) {
     const std::string error = "Cannot download OSTree target " + target.filename() + " with the RAUC package manager!";
     LOG_ERROR << error;
     return {false, error};
   }
 
-  return PackageManagerInterface::fetchTarget(target, fetcher, keys, progress_cb, token);
+  // Nothing to download: RAUC streams the bundle while installing it.
+  repo_server_ = fetcher.getRepoServer();
+  return {true, ""};
+}
+
+#ifdef BUILD_OFFLINE_UPDATES
+PackageManagerInterface::FetchResult RaucManager::fetchTargetOffUpd(const Uptane::Target &target,
+                                                                    const Uptane::OfflineUpdateFetcher &fetcher,
+                                                                    const KeyManager &keys,
+                                                                    const FetcherProgressCb &progress_cb,
+                                                                    const api::FlowControlToken *token) {
+  repo_server_.clear();
+  return PackageManagerInterface::fetchTargetOffUpd(target, fetcher, keys, progress_cb, token);
+}
+#endif
+
+// RAUC checks a streamed bundle against its manifest hash.
+TargetStatus RaucManager::verifyTarget(const Uptane::Target &target) const {
+  if (!repo_server_.empty()) {
+    return TargetStatus::kGood;
+  }
+  return PackageManagerInterface::verifyTarget(target);
 }
